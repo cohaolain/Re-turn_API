@@ -129,5 +129,7 @@ def barcode():
         return jsonify({"success": False, "message": f"Invalid Response from Re-Turn API - Status Code: {response.status_code}, Reason: {response.reason}", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), response.status_code
     
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run()
+else:
+    gunicorn_app = app
