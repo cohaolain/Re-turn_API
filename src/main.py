@@ -57,19 +57,36 @@ def update_cache(barcode_no, value):
 
 CACHE_TIMEOUT_SECONDS = 86400
 @app.route('/barcode', methods=['GET'])
-def barcode():
+def barcode(try_convert_to_ean13=True):
     barcode_no = request.args.get('barcodeNo')
     start_time = time.time()
+
+    def get_common_log_line_contents():
+        ip = request.headers['X-Real-Ip'] if 'X-Real-Ip' in request.headers else request.remote_addr
+        return f"IP={ip} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no}"
     
     if not barcode_no:
-        logger.warn(f"MsgType=BarcodeRequestInvalid IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} Reason=BarcodeNotProvided")
+        logger.warn(f"MsgType=BarcodeRequestInvalid {get_common_log_line_contents()} Reason=BarcodeNotProvided")
         return jsonify({"success": False, "message": "'barcodeNo' is required."}), 400
     
     if not barcode_no.isnumeric():
-        logger.warn(f"MsgType=BarcodeRequestInvalid IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} Reason=BarcodeNotNumeric")
+        logger.warn(f"MsgType=BarcodeRequestInvalid {get_common_log_line_contents()} Reason=BarcodeNotNumeric")
         return jsonify({"success": False, "message": "'barcodeNo' must be a number."}), 400
     
     likely_good_barcode = verify_checksum(barcode_no)
+
+    try_again_with_upc_code_if_eac13_not_in_scheme = False
+    if try_convert_to_ean13 and len(barcode_no) == 12:
+        # This has been read/provided as a UPC A barcode, but this can also be
+        # written as an EAN13 barcode by prepending a zero 
+        # (likely visible under barcode in text).
+        # The API call below returns true _only_ when the number matches exactly
+        # the barcode registered - i.e. the optional zero matters if it's there.
+        # Therefore, let's also try query _with_ the zero prepended.
+        # In fact, it's probably more likely to match this way - so try it first!
+        barcode_no = f"0{barcode_no}"
+        logger.warn(f"Prepending 0 to 12-digit barcode yielding {barcode_no}")
+        try_again_with_upc_code_if_eac13_not_in_scheme = True
             
     cache = load_cache()
         
@@ -77,8 +94,13 @@ def barcode():
     if barcode_no in cache:
         if time.time() - cache[barcode_no]["timestamp"] < CACHE_TIMEOUT_SECONDS:
             is_in_return_scheme = cache[barcode_no]["isPartOfReturnScheme"]
-            logger.info(f"MsgType=BarcodeRequestSuccess IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=Cache")
-            return jsonify({"success": True, "isPartOfReturnScheme": is_in_return_scheme, "responseFrom": "cache", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 200
+
+            # Check to see if we want another shot at this without an applied conversion
+            if not is_in_return_scheme and try_again_with_upc_code_if_eac13_not_in_scheme:
+                return barcode(try_convert_to_ean13=False)
+
+            logger.info(f"MsgType=BarcodeRequestSuccess {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=Cache")
+            return jsonify({"success": True, "isPartOfReturnScheme": is_in_return_scheme, "responseFrom": "cache", "barcodeNo": barcode_no, "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 200
         cached_value = cache[barcode_no]
     
     url = "https://re-turn.ie/wp-admin/admin-ajax.php"
@@ -106,26 +128,30 @@ def barcode():
 
             result = {"timestamp": time.time(), "isPartOfReturnScheme": is_in_return_scheme}
             
-            update_cache(barcode_no, result)  
+            update_cache(barcode_no, result)
+
+            # Check to see if we want another shot at this without an applied conversion
+            if not is_in_return_scheme and try_again_with_upc_code_if_eac13_not_in_scheme:
+                return barcode(try_convert_to_ean13=False)
                 
             # Best case scenario
-            logger.info(f"MsgType=BarcodeRequestSuccess IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=API")
+            logger.info(f"MsgType=BarcodeRequestSuccess {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=API")
             return jsonify({"success": True, "isPartOfReturnScheme": is_in_return_scheme, "responseFrom": "api", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 200
         
         if cached_value:
             is_in_return_scheme = cached_value["isPartOfReturnScheme"]
-            logger.info(f"MsgType=BarcodeRequestFailureWithStaleCacheFallback IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=StaleCacheFallback Reason=ValidResponseButCouldNotParse")
+            logger.info(f"MsgType=BarcodeRequestFailureWithStaleCacheFallback {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=StaleCacheFallback Reason=ValidResponseButCouldNotParse")
             return jsonify({"success": True, "isPartOfReturnScheme": is_in_return_scheme, "responseFrom": "stale_cache_fallback", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 200
 
-        logger.error(f"MsgType=BarcodeRequestFailure IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} Reason=ValidResponseButCouldNotParse")
+        logger.error(f"MsgType=BarcodeRequestFailure {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} Reason=ValidResponseButCouldNotParse")
         return jsonify({"success": False, "message": "Got ok response from API, but was unable to parse it.", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 500
     else:
         if cached_value:
             is_in_return_scheme = cached_value["isPartOfReturnScheme"]
-            logger.info(f"MsgType=BarcodeRequestFailureWithStaleCacheFallback IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=StaleCacheFallback Reason=InvalidResponseFromAPI StatusCode={response.status_code} ResponseReason='{response.reason}'")
+            logger.info(f"MsgType=BarcodeRequestFailureWithStaleCacheFallback {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} IsPartOfReturnScheme={is_in_return_scheme} ResponseFrom=StaleCacheFallback Reason=InvalidResponseFromAPI StatusCode={response.status_code} ResponseReason='{response.reason}'")
             return jsonify({"success": True, "isPartOfReturnScheme": is_in_return_scheme, "responseFrom": "stale_cache_fallback", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), 200
 
-        logger.error(f"MsgType=BarcodeRequestFailure IP={request.headers['X-Real-Ip']} QueryTimeMs={(time.time() - start_time)*1000} BarcodeNo={barcode_no} BarcodeValidChecksum={likely_good_barcode} Reason=InvalidResponseFromAPI StatusCode={response.status_code} ResponseReason='{response.reason}'")
+        logger.error(f"MsgType=BarcodeRequestFailure {get_common_log_line_contents()} BarcodeValidChecksum={likely_good_barcode} Reason=InvalidResponseFromAPI StatusCode={response.status_code} ResponseReason='{response.reason}'")
         return jsonify({"success": False, "message": f"Invalid Response from Re-Turn API - Status Code: {response.status_code}, Reason: {response.reason}", "barcodeNo": int(barcode_no), "barcodeValidChecksum": likely_good_barcode, "queryTimeMs": (time.time() - start_time)*1000}), response.status_code
     
 
