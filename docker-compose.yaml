@@ -1,0 +1,12 @@
+services:
+  re-turn_api:
+    container_name: re-turn_api
+    build:
+      context: /home/ciaran/server/apps/re-turn_api
+      dockerfile: Dockerfile
+    ports:
+      - "13534:13534"
+    volumes:
+      - /home/ciaran/server/apps/re-turn_api/src/re-turn_api.log:/app/src/re-turn_api.log
+      - /home/ciaran/server/apps/re-turn_api/src/cache.json:/app/src/cache.json
+    restart: unless-stopped
